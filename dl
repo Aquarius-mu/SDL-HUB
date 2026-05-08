@@ -1,0 +1,367 @@
+#!/bin/bash
+# dl - 通用下载器，支持 GitHub 加速和代理镜像
+# 用法:
+#   dl <url>                     # 直接下载（自动检测 GitHub 并走镜像）
+#   dl github:user/repo/tag/file # 从 GitHub release 下载
+#   dl --proxy <url>             # 通过代理下载
+#   dl --list                    # 列出可用镜像源
+#   dl --test                    # 测试各镜像源速度
+
+set -euo pipefail
+
+# ==================== 配置 ====================
+MIRRORS=(
+    "https://ghproxy.cn"
+    "https://ghps.cc"
+    "https://gh.xmly.dev"
+)
+DEFAULT_TIMEOUT=15
+DOWNLOAD_DIR="${HOME}/Downloads"
+LOG_FILE="/tmp/dl.log"
+
+# ==================== 颜色 ====================
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# ==================== 工具函数 ====================
+log() { echo -e "${BLUE}[dl]${NC} $*"; }
+ok()  { echo -e "${GREEN}[ok]${NC} $*"; }
+warn(){ echo -e "${YELLOW}[warn]${NC} $*"; }
+err() { echo -e "${RED}[error]${NC} $*" >&2; }
+
+usage() {
+    cat <<'EOF'
+dl - 通用下载器
+
+用法:
+  dl <url>                        下载文件（GitHub 自动走镜像加速）
+  dl github:<user>/<repo>/<tag>/<file>   从 GitHub Release 下载
+  dl clone <url> [dir]            克隆 GitHub 仓库（SSH 自动转 HTTPS 镜像）
+  dl <url1> <url2> ...            批量下载
+  dl --proxy <url>                强制通过代理下载
+  dl --direct <url>               强制直连下载
+  dl --mirror <N> <url>           使用第 N 个镜像源
+  dl --list                       列出可用镜像源
+  dl --test                       测试镜像源速度
+  dl --out <dir> <url>            指定输出目录
+
+示例:
+  dl https://github.com/jesseduffield/lazygit/releases/latest/download/lazygit_0.44.1_Linux_x86_64.tar.gz
+  dl github:jesseduffield/lazygit/latest/lazygit_0.44.1_Linux_x86_64.tar.gz
+  dl clone git@github.com:user/repo.git
+  dl clone https://github.com/user/repo.git /tmp/repo
+  dl --proxy https://example.com/file.zip
+  dl --out /tmp https://example.com/a.zip https://example.com/b.tar.gz
+EOF
+}
+
+# ==================== 镜像源测试 ====================
+test_mirrors() {
+    log "测试镜像源速度..."
+    local test_url="https://github.com/favicon.ico"
+    for mirror in "${MIRRORS[@]}"; do
+        local url="${mirror}/${test_url}"
+        local start=$(date +%s%N)
+        if curl -sSf -o /dev/null --connect-timeout 5 --max-time 10 "$url" 2>/dev/null; then
+            local end=$(date +%s%N)
+            local ms=$(( (end - start) / 1000000 ))
+            ok "$mirror  ${ms}ms"
+        else
+            err "$mirror  不可达"
+        fi
+    done
+}
+
+list_mirrors() {
+    log "可用镜像源:"
+    for i in "${!MIRRORS[@]}"; do
+        echo "  [$((i+1))] ${MIRRORS[$i]}"
+    done
+}
+
+# ==================== 核心下载逻辑 ====================
+
+# 尝试从多个镜像下载
+download_with_mirrors() {
+    set +e  # 镜像轮询需要容忍单个失败
+    local url="$1"
+    local output="$2"
+    local mirror_index="${3:-}"
+
+    # 如果指定了镜像索引
+    if [[ -n "$mirror_index" ]]; then
+        local idx=$((mirror_index - 1))
+        if [[ $idx -ge 0 && $idx -lt ${#MIRRORS[@]} ]]; then
+            local mirrored="${MIRRORS[$idx]}/${url}"
+            log "使用镜像 [${mirror_index}]: ${MIRRORS[$idx]}"
+            if curl -fSL --connect-timeout "$DEFAULT_TIMEOUT" --progress-bar -o "$output" "$mirrored" 2>&1; then
+                set -e
+                return 0
+            fi
+            warn "镜像 [${mirror_index}] 失败"
+            set -e
+            return 1
+        fi
+        err "镜像索引无效: $mirror_index"
+        set -e
+        return 1
+    fi
+
+    # 依次尝试各镜像
+    for i in "${!MIRRORS[@]}"; do
+        local mirror="${MIRRORS[$i]}"
+        local mirrored="${mirror}/${url}"
+        log "尝试镜像 [$((i+1))/${#MIRRORS[@]}]: $mirror"
+        curl -fSL --connect-timeout "$DEFAULT_TIMEOUT" --progress-bar -o "$output" "$mirrored" >> "$LOG_FILE" 2>&1
+        if [[ $? -eq 0 ]]; then
+            ok "下载成功 (via $mirror)"
+            set -e
+            return 0
+        fi
+        warn "失败，尝试下一个..."
+    done
+    set -e
+    return 1
+}
+
+# 直连下载
+download_direct() {
+    local url="$1"
+    local output="$2"
+    log "直连下载: $url"
+    curl -fSL --connect-timeout "$DEFAULT_TIMEOUT" --progress-bar -o "$output" "$url" 2>&1
+}
+
+# ==================== URL 解析 ====================
+
+# 检测是否是 GitHub URL
+is_github_url() {
+    [[ "$1" =~ github\.com ]] || [[ "$1" =~ raw\.githubusercontent\.com ]]
+}
+
+# 解析 github:user/repo/tag/file 格式
+parse_github_short() {
+    local input="$1"
+    # 格式: github:user/repo/tag/file
+    if [[ "$input" =~ ^github:([^/]+)/([^/]+)/([^/]+)/(.+)$ ]]; then
+        local user="${BASH_REMATCH[1]}"
+        local repo="${BASH_REMATCH[2]}"
+        local tag="${BASH_REMATCH[3]}"
+        local file="${BASH_REMATCH[4]}"
+        echo "https://github.com/${user}/${repo}/releases/download/${tag}/${file}"
+    else
+        err "GitHub 短格式解析失败: $input"
+        err "格式: github:<user>/<repo>/<tag>/<file>"
+        return 1
+    fi
+}
+
+# ==================== Git Clone 加速 ====================
+
+# 从任意 GitHub URL 中提取 user/repo
+extract_github_user_repo() {
+    local url="$1"
+    # SSH 格式: git@github.com:user/repo.git
+    if [[ "$url" =~ git@github\.com[:/](.+)/(.+?)(\.git)?$ ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        return
+    fi
+    # HTTPS 格式: https://github.com/user/repo[/...][.git]
+    if [[ "$url" =~ github\.com[:/](.+)/(.+?)(\.git|/|$) ]]; then
+        echo "${BASH_REMATCH[1]}/${BASH_REMATCH[2]}"
+        return
+    fi
+    return 1
+}
+
+# 克隆 GitHub 仓库（SSH 端口 443 优先，HTTPS 兜底）
+git_clone_with_mirror() {
+    local url="$1"
+    local target_dir="${2:-}"
+
+    local user_repo
+    user_repo=$(extract_github_user_repo "$url") || {
+        err "无法解析 GitHub 仓库地址: $url"
+        return 1
+    }
+
+    local repo_name
+    repo_name=$(basename "$user_repo" .git)
+    local clone_dir="${target_dir:-$repo_name}"
+
+    log "仓库: $user_repo"
+
+    # 方法1: SSH 端口 443（绕过 GFW 最可靠）
+    local ssh_url="git@github.com:${user_repo}.git"
+    log "尝试 SSH (端口 443): $ssh_url"
+    if GIT_SSH_COMMAND="ssh -p 443 -o ConnectTimeout=10" git clone --depth 1 "$ssh_url" "$clone_dir" 2>&1; then
+        ok "克隆成功 (SSH 端口 443)"
+        ok "仓库路径: $clone_dir"
+        return 0
+    fi
+    warn "SSH 克隆失败，尝试 HTTPS..."
+
+    # 方法2: HTTPS 直连
+    local https_url="https://github.com/${user_repo}.git"
+    log "尝试 HTTPS 直连: $https_url"
+    if timeout 15 git clone --depth 1 "$https_url" "$clone_dir" 2>&1; then
+        ok "克隆成功 (HTTPS 直连)"
+        ok "仓库路径: $clone_dir"
+        return 0
+    fi
+    warn "HTTPS 直连失败，尝试镜像..."
+
+    # 方法3: 镜像加速（仅对支持 git smart HTTP 的镜像有效）
+    for mirror in "${MIRRORS[@]}"; do
+        local mirror_url="${mirror}/${https_url}"
+        log "尝试镜像: $mirror"
+        if timeout 15 git clone --depth 1 "$mirror_url" "$clone_dir" 2>&1; then
+            (cd "$clone_dir" && git remote set-url origin "$https_url" 2>/dev/null) || true
+            ok "克隆成功 (via $mirror)"
+            ok "仓库路径: $clone_dir"
+            ok "remote origin 已设为: $https_url"
+            return 0
+        fi
+        rm -rf "$clone_dir" 2>/dev/null
+    done
+
+    err "所有方式均失败"
+    err "请确认已将 SSH 公钥添加到 GitHub: https://github.com/settings/keys"
+    err "公钥: cat ~/.ssh/id_ed25519.pub"
+    return 1
+}
+
+# ==================== 主逻辑 ====================
+
+main() {
+    local urls=()
+    local mode="auto"  # auto|proxy|direct|mirror
+    local mirror_index=""
+    local output_dir="$DOWNLOAD_DIR"
+
+    # 解析参数
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --help|-h)
+                usage; exit 0 ;;
+            --list)
+                list_mirrors; exit 0 ;;
+            --test)
+                test_mirrors; exit 0 ;;
+            clone)
+                shift
+                if [[ $# -eq 0 ]]; then
+                    err "用法: dl clone <github-url> [目录]"
+                    exit 1
+                fi
+                local clone_url="$1"; shift
+                local clone_dir="${1:-}"
+                git_clone_with_mirror "$clone_url" "$clone_dir"
+                exit $? ;;
+            --proxy)
+                mode="proxy"; shift ;;
+            --direct)
+                mode="direct"; shift ;;
+            --mirror)
+                mode="mirror"; mirror_index="$2"; shift 2 ;;
+            --out)
+                output_dir="$2"; shift 2 ;;
+            -*)
+                err "未知选项: $1"; usage; exit 1 ;;
+            *)
+                urls+=("$1"); shift ;;
+        esac
+    done
+
+    if [[ ${#urls[@]} -eq 0 ]]; then
+        usage
+        exit 1
+    fi
+
+    mkdir -p "$output_dir"
+    > "$LOG_FILE"
+
+    local success=0
+    local failed=0
+
+    for url in "${urls[@]}"; do
+        echo ""
+
+        # 解析 GitHub 短格式
+        if [[ "$url" =~ ^github: ]]; then
+            url=$(parse_github_short "$url") || { ((failed++)) || true; continue; }
+        fi
+
+        # 确定输出文件名
+        local filename=$(basename "$url" | sed 's/?.*//' | sed 's/.*\///')
+        local output="${output_dir}/${filename}"
+
+        log "下载: $url"
+        log "保存到: $output"
+
+        case "$mode" in
+            direct)
+                if download_direct "$url" "$output"; then
+                    ok "完成: $output"
+                    ((success++)) || true
+                else
+                    err "下载失败: $url"
+                    ((failed++)) || true
+                fi
+                ;;
+            proxy)
+                if download_with_mirrors "$url" "$output"; then
+                    ok "完成: $output"
+                    ((success++)) || true
+                else
+                    err "所有镜像均失败: $url"
+                    ((failed++)) || true
+                fi
+                ;;
+            mirror)
+                if download_with_mirrors "$url" "$output" "$mirror_index"; then
+                    ok "完成: $output"
+                    ((success++)) || true
+                else
+                    err "镜像下载失败: $url"
+                    ((failed++)) || true
+                fi
+                ;;
+            auto)
+                if is_github_url "$url"; then
+                    log "检测到 GitHub URL，使用镜像加速"
+                    if download_with_mirrors "$url" "$output"; then
+                        ok "完成: $output"
+                        ((success++)) || true
+                    else
+                        warn "镜像失败，尝试直连..."
+                        if download_direct "$url" "$output"; then
+                            ok "完成: $output"
+                            ((success++)) || true
+                        else
+                            err "下载失败: $url"
+                            ((failed++)) || true
+                        fi
+                    fi
+                else
+                    if download_direct "$url" "$output"; then
+                        ok "完成: $output"
+                        ((success++)) || true
+                    else
+                        err "下载失败: $url"
+                        ((failed++)) || true
+                    fi
+                fi
+                ;;
+        esac
+    done
+
+    echo ""
+    log "结果: ${success} 成功, ${failed} 失败"
+    [[ $failed -eq 0 ]] || exit 1
+}
+
+main "$@"
